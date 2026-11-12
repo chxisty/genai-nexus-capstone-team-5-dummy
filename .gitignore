@@ -12,8 +12,10 @@ __pycache__/
 
 # Testing and cache
 .pytest_cache/
+.pytest-tmp/
 .coverage
 htmlcov/
+index/railassist_index.json
 
 # IDE
 .vscode/

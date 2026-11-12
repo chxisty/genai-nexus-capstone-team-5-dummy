@@ -1,6 +1,8 @@
 
 import os
 import json
+import argparse
+from pathlib import Path
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -25,22 +27,46 @@ console = Console(
     width=None
 )
 
-# Reload values from .env even if already set
-load_dotenv(override=True)
+_legacy_client = None
 
-api_key = os.getenv("GROQ_API_KEY")
 
-model = os.getenv(
-    "GROQ_MODEL",
-    "openai/gpt-oss-20b"
-)
+def _get_legacy_client():
+    """Create the legacy client only when a question is actually asked."""
+    global _legacy_client
+    if _legacy_client is not None:
+        return _legacy_client
 
-if not api_key:
-    raise ValueError(
-        "GROQ_API_KEY is missing from your .env file."
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key or api_key.lower() in {
+        "your_groq_api_key_here", "placeholder", "replace_me"
+    }:
+        raise RuntimeError("GROQ_API_KEY is not configured. Put your key in the local .env file.")
+
+    _legacy_client = Groq(
+        api_key=api_key,
+        timeout=float(os.getenv("GROQ_TIMEOUT_SECONDS", "30")),
+        max_retries=2,
     )
+    return _legacy_client
 
-client = Groq(api_key=api_key)
+
+class _LazyCompletions:
+    def create(self, *args, **kwargs):
+        return _get_legacy_client().chat.completions.create(*args, **kwargs)
+
+
+class _LazyChat:
+    completions = _LazyCompletions()
+
+
+class _LazyClient:
+    chat = _LazyChat()
+
+
+# Keep the tested legacy API surface without requiring credentials at import time.
+client = _LazyClient()
+model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 
 # ==========================================
@@ -329,88 +355,78 @@ def ask_question(question):
     )
 
 
+def ask(question):
+    """Return the capstone response object with citations and SQL trace."""
+    from helpdesk.pipeline import ask as run_pipeline
+
+    return run_pipeline(question)
+
+
 # ==========================================
 # TERMINAL INTERFACE
 # ==========================================
 
 
 def main():
+    parser = argparse.ArgumentParser(description="RailAssist Indian Railways terminal helpdesk")
+    parser.add_argument("question", nargs="*", help="Ask one question; omit it for an interactive session")
+    args = parser.parse_args()
 
-    console.print()
+    from helpdesk.pipeline import index_warnings, reset_conversation
 
-    console.rule(
-        "[bold cyan]RAILASSIST - AI RAILWAY HELPDESK[/bold cyan]"
-    )
+    def display(result):
+        console.print(Markdown(result["answer"]))
+        if result.get("sources"):
+            labels = [
+                f"{source['doc']} (page {source['page']})" if source["page"] is not None
+                else f"{source['doc']} (HTML)"
+                for source in result["sources"]
+            ]
+            console.print("[dim]Sources: " + "; ".join(labels) + "[/dim]")
+        if result.get("sql"):
+            console.print("[dim]SQL: " + result["sql"] + "[/dim]")
 
-    console.print(
-        "\nAsk me anything about Indian Railways!"
-    )
+    console.rule("[bold cyan]RAILASSIST - AI RAILWAY HELPDESK[/bold cyan]")
+    if args.question:
+        try:
+            for warning in index_warnings():
+                console.print(f"[yellow]Document warning:[/yellow] {warning}")
+            display(ask(" ".join(args.question)))
+            return
+        except Exception as error:
+            console.print(f"[bold red]RailAssist error:[/bold red] {error}")
+            raise SystemExit(1) from None
 
-    console.print(
-        "[dim]Type 'reset' to clear conversation memory "
-        "or 'exit' to stop.[/dim]\n"
-    )
+    console.print("Ask a railway question. Type 'reset' to clear memory or 'exit' to stop.\n")
+    try:
+        for warning in index_warnings():
+            console.print(f"[yellow]Document warning:[/yellow] {warning}")
+    except Exception as error:
+        console.print(f"[yellow]Document index notice:[/yellow] {error}")
 
     while True:
-
         try:
-            question = console.input(
-                "[bold green]You:[/bold green] "
-            ).strip()
-
-            # Exit command
-            if question.lower() in ["exit", "quit"]:
-
-                console.print(
-                    "\n[bold cyan]RailAssist:[/bold cyan] Goodbye!"
-                )
-                break
-
-            # Reset conversation memory
+            question = console.input("[bold green]You:[/bold green] ").strip()
+            if question.lower() in {"exit", "quit"}:
+                console.print("RailAssist: Goodbye!")
+                return
             if question.lower() == "reset":
-
-                conversation_messages[:] = [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT
-                    }
-                ]
-
-                console.print(
-                    "\n[bold yellow]Conversation memory cleared![/bold yellow]\n"
-                )
-
+                reset_conversation()
+                conversation_messages[:] = [{"role": "system", "content": SYSTEM_PROMPT}]
+                console.print("[yellow]Conversation memory cleared.[/yellow]")
                 continue
-
             if not question:
                 continue
-
-            # Single loading indicator
-            with console.status(
-                "[bold cyan]Loading.....[/bold cyan]",
-                spinner="dots"
-            ):
-                answer = ask_question(question)
-
-            # Display formatted answer
+            with console.status("[cyan]Searching the railway pack and timetable...[/cyan]", spinner="dots"):
+                result = ask(question)
+            console.print("\n[bold cyan]RailAssist:[/bold cyan]")
+            display(result)
             console.print()
-            console.print(
-                "[bold cyan]RailAssist[/bold cyan]"
-            )
-            console.print(Markdown(answer))
-            console.print()
-
         except KeyboardInterrupt:
-            console.print(
-                "\n[bold cyan]RailAssist:[/bold cyan] Goodbye!"
-            )
-            break
-
+            console.print("\nRailAssist: Goodbye!")
+            return
         except Exception as error:
-            console.print(
-                f"\n[bold red]Error:[/bold red] "
-                f"{error}\n"
-            )
+            console.print(f"[bold red]RailAssist error:[/bold red] {error}\n")
 
 
 
